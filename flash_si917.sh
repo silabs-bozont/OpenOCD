@@ -7,17 +7,51 @@
 # replay the SWD switch sequence, hence the two invocations.
 #
 # usage: flash_si917.sh <image.rps>
+#        flash_si917.sh --erase
 set -e
 
-rps="$1"
-if [ -z "$rps" ] || [ ! -f "$rps" ]; then
+usage()
+{
 	echo "usage: $0 <image.rps>" >&2
-	exit 1
-fi
+	echo "       $0 --erase" >&2
+}
 
-# Resolve the image before moving to the OpenOCD tree, so relative paths work
-# from whatever directory the script is called in.
-rps="$(cd "$(dirname "$rps")" && pwd)/$(basename "$rps")"
+mode=flash
+case "${1-}" in
+	--erase|-e)
+		if [ "$#" -ne 1 ]; then
+			usage
+			exit 1
+		fi
+		mode=erase
+		preselect=0
+		boot_command=0xa14d
+		boot_response=0xab4d
+		boot_timeout_ms=120000
+		openocd_command="flash erase_sector 0 0 0"
+		;;
+	--help|-h)
+		usage
+		exit 0
+		;;
+	*)
+		rps="${1-}"
+		if [ "$#" -ne 1 ] || [ ! -f "$rps" ]; then
+			usage
+			exit 1
+		fi
+
+		# Resolve the image before moving to the OpenOCD tree, so relative paths
+		# work from whatever directory the script is called in.
+		rps="$(cd "$(dirname "$rps")" && pwd)/$(basename "$rps")"
+		preselect=1
+		boot_command=0xa134
+		boot_response=0xab32
+		boot_timeout_ms=1500
+		openocd_command="flash write_bank 0 $rps 0"
+		;;
+esac
+
 cd "$(dirname "$0")"
 
 log=$(mktemp)
@@ -28,6 +62,9 @@ cycle=0
 while [ $cycle -lt 5 ]; do
 	echo "power-cycling Si917"
 	./src/openocd -s tcl -f board/si917_powercycle.cfg >/dev/null 2>&1
+	if [ "$mode" = erase ]; then
+		echo "erasing Si917 common flash"
+	fi
 
 	i=0
 	while [ $i -lt 60 ]; do
@@ -38,23 +75,24 @@ while [ $cycle -lt 5 ]; do
 			set +e
 			./src/openocd -s tcl -f tcl/board/si917_flash.cfg -c "
 init
-# Restart the TA bootloader before selecting M4 upgrade.  The NWP ignores the
-# command at board-ready unless TA_RESET is first pulsed from 1 to 0.
-if {![catch {set v [read_memory 0x4105003c 32 1]}] &&
+# Upload mode may be selected while the M4 runs.  Erase is selected later by
+# the flash driver, after halt, because erasing its XIP image makes a running M4
+# fault and destabilizes SWD.
+if {$preselect && ![catch {set v [read_memory 0x4105003c 32 1]}] &&
 	([expr {\$v & 0xffff}] == 0xab11)} {
 	write_memory 0x22000004 32 1
 	sleep 50
 	write_memory 0x22000004 32 0
 	write_memory 0x4105003c 32 0
-	write_memory 0x41050034 32 0xa134
-	set deadline [expr {[clock milliseconds] + 1500}]
+	write_memory 0x41050034 32 $boot_command
+	set deadline [expr {[clock milliseconds] + $boot_timeout_ms}]
 	while {[clock milliseconds] < \$deadline} {
 		set v [read_memory 0x4105003c 32 1]
-		if {[expr {\$v & 0xffff}] == 0xab32} { break }
+		if {[expr {\$v & 0xffff}] == $boot_response} { break }
 	}
 }
 halt
-flash write_bank 0 $rps 0
+$openocd_command
 shutdown" 2>&1
 			echo $? >"$status"
 		} | grep --line-buffered -v -e "Error connecting DP" -e "DAP init failed" \
@@ -64,10 +102,18 @@ shutdown" 2>&1
 			echo "restarting Si917"
 			if ! ./src/openocd -s tcl -f board/si917_powercycle.cfg \
 				>/dev/null 2>&1; then
-				echo "flashed $rps, but failed to restart the Si917" >&2
+				if [ "$mode" = erase ]; then
+					echo "erased Si917 common flash, but failed to restart it" >&2
+				else
+					echo "flashed $rps, but failed to restart the Si917" >&2
+				fi
 				exit 1
 			fi
-			echo "flashed $rps and restarted Si917"
+			if [ "$mode" = erase ]; then
+				echo "erased Si917 common flash and restarted Si917"
+			else
+				echo "flashed $rps and restarted Si917"
+			fi
 			exit 0
 		fi
 
