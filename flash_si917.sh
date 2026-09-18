@@ -45,7 +45,15 @@ case "${1-}" in
 		# work from whatever directory the script is called in.
 		rps="$(cd "$(dirname "$rps")" && pwd)/$(basename "$rps")"
 		preselect=1
-		boot_command=0xa134
+		image_version=$(od -An -t u4 -N 4 "$rps" | tr -d '[:space:]')
+		case "$image_version" in
+			0) boot_command=0xa042 ;; # NWP RPS: image 0, BURN_NWP_FW ('B')
+			1) boot_command=0xa134 ;; # M4 RPS: image 1, UPGRADE_M4 ('4')
+			*)
+				echo "unsupported Si917 RPS image type: $image_version" >&2
+				exit 1
+				;;
+		esac
 		boot_response=0xab32
 		boot_timeout_ms=1500
 		openocd_command="flash write_bank 0 $rps 0"

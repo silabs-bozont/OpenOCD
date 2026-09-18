@@ -30,8 +30,10 @@
 #define SIWX917_HOST_VALID			0xab00
 #define SIWX917_BOARD_READY			0xab11
 #define SIWX917_BOOT_VALID			0xa000
+#define SIWX917_IMAGE_NWP			0x0000
 #define SIWX917_IMAGE_M4			0x0100
 
+#define SIWX917_BURN_NWP			'B'
 #define SIWX917_UPGRADE_M4			'4'
 #define SIWX917_ERASE_COMMON_FLASH		'M'
 #define SIWX917_SEND_RPS			'2'
@@ -40,7 +42,7 @@
 #define SIWX917_END_OF_FILE			'E'
 #define SIWX917_UPGRADE_SUCCESS			'S'
 
-#define SIWX917_RPS_VERSION			1
+#define SIWX917_RPS_TYPE_MAX			1
 #define SIWX917_RPS_MAGIC			0x900d900d
 
 #define SIWX917_BOARD_READY_TIMEOUT_MS		5000
@@ -139,16 +141,18 @@ static int siwx917_select_option(struct flash_bank *bank, uint8_t option,
 		uint32_t timeout_ms)
 {
 	/*
-	 * AN1497 rsi_select_option() clears bits 11:8 of 0xab00 and inserts
-	 * image number 1 for M4/common-flash commands.
+	 * AN1497 rsi_select_option() uses image number 0 for NWP firmware and
+	 * image number 1 for M4 and common-flash commands.
 	 */
-	uint16_t command = SIWX917_BOOT_VALID | SIWX917_IMAGE_M4 | option;
+	uint16_t image = option == SIWX917_BURN_NWP ?
+		SIWX917_IMAGE_NWP : SIWX917_IMAGE_M4;
+	uint16_t command = SIWX917_BOOT_VALID | image | option;
 	int retval = siwx917_write_nwp(bank, command);
 	if (retval != ERROR_OK)
 		return retval;
 
 	uint16_t response = SIWX917_HOST_VALID | option;
-	if (option == SIWX917_UPGRADE_M4)
+	if (option == SIWX917_UPGRADE_M4 || option == SIWX917_BURN_NWP)
 		response = SIWX917_HOST_VALID | SIWX917_SEND_RPS;
 
 	return siwx917_wait_nwp(bank, response, timeout_ms, "command selection");
@@ -168,7 +172,7 @@ static int siwx917_prepare(struct flash_bank *bank, uint8_t option,
 		return retval;
 
 	uint16_t expected = SIWX917_HOST_VALID | option;
-	if (option == SIWX917_UPGRADE_M4)
+	if (option == SIWX917_UPGRADE_M4 || option == SIWX917_BURN_NWP)
 		expected = SIWX917_HOST_VALID | SIWX917_SEND_RPS;
 
 	/* A retry may re-enter after the command was already accepted. */
@@ -228,7 +232,8 @@ static int siwx917_erase(struct flash_bank *bank, unsigned int first,
 	return retval;
 }
 
-static int siwx917_validate_rps(const uint8_t *buffer, uint32_t count)
+static int siwx917_validate_rps(const uint8_t *buffer, uint32_t count,
+		uint8_t *option)
 {
 	if (count < 64) {
 		LOG_ERROR("SiWx917 image is too short to contain an RPS header");
@@ -239,15 +244,10 @@ static int siwx917_validate_rps(const uint8_t *buffer, uint32_t count)
 	uint32_t magic = le_to_h_u32(buffer + 4);
 	uint32_t declared_size = le_to_h_u32(buffer + 8);
 
-	if (version != SIWX917_RPS_VERSION || magic != SIWX917_RPS_MAGIC) {
-		LOG_ERROR("SiWx917 programming requires an M4 RPS image "
+	if (version > SIWX917_RPS_TYPE_MAX || magic != SIWX917_RPS_MAGIC) {
+		LOG_ERROR("SiWx917 programming requires an M4 or NWP RPS image "
 			"(version 0x%08" PRIx32 ", magic 0x%08" PRIx32 ")",
 			version, magic);
-		return ERROR_FLASH_BANK_INVALID;
-	}
-
-	if (!(version & 1)) {
-		LOG_ERROR("SiWx917 image is not an M4 RPS image");
 		return ERROR_FLASH_BANK_INVALID;
 	}
 
@@ -256,6 +256,8 @@ static int siwx917_validate_rps(const uint8_t *buffer, uint32_t count)
 			", file=%" PRIu32, declared_size, count);
 		return ERROR_FLASH_BANK_INVALID;
 	}
+
+	*option = version & 1 ? SIWX917_UPGRADE_M4 : SIWX917_BURN_NWP;
 
 	return ERROR_OK;
 }
@@ -268,15 +270,19 @@ static int siwx917_write(struct flash_bank *bank, const uint8_t *buffer,
 		return ERROR_FLASH_DST_BREAKS_ALIGNMENT;
 	}
 
-	int retval = siwx917_validate_rps(buffer, count);
+	uint8_t option;
+	int retval = siwx917_validate_rps(buffer, count, &option);
 	if (retval != ERROR_OK)
 		return retval;
 
 	/* Leaves the NWP asking for the RPS stream, so no command selection. */
-	retval = siwx917_prepare(bank, SIWX917_UPGRADE_M4,
+	retval = siwx917_prepare(bank, option,
 		SIWX917_COMMAND_TIMEOUT_MS);
 	if (retval != ERROR_OK)
 		return retval;
+
+	LOG_INFO("SiWx917 %s RPS programming started",
+		option == SIWX917_BURN_NWP ? "NWP" : "M4");
 
 	uint8_t *page = malloc(SIWX917_PAGE_SIZE);
 	if (!page)
